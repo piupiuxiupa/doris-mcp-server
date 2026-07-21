@@ -45,6 +45,46 @@ mcp_auth_context_var: ContextVar['AuthContext'] = ContextVar('mcp_auth_context',
 RESERVED_DORIS_OAUTH_TOKEN_PREFIX = "doa_"
 
 
+def extract_auth_info_from_scope(scope, headers) -> dict:
+    """Extract authentication information (client_ip, token) from ASGI scope + headers.
+
+    Pure function with no dependency on any server instance, so it is safe to
+    call from any ASGI entrypoint (single-worker HTTP or multi-worker). Mirrors
+    ``DorisServer._extract_auth_info_from_scope``.
+    """
+    auth_info = {}
+
+    # Extract client IP
+    client = scope.get("client")
+    if client:
+        auth_info["client_ip"] = client[0]
+    else:
+        auth_info["client_ip"] = "unknown"
+
+    # Extract token from Authorization header
+    authorization = headers.get(b'authorization', b'').decode('utf-8')
+    if authorization:
+        if authorization.startswith('Bearer '):
+            auth_info["token"] = authorization[7:]
+            auth_info["authorization"] = authorization
+        elif authorization.startswith('Token '):
+            auth_info["token"] = authorization[6:]
+            auth_info["authorization"] = authorization
+
+    # Extract token from query parameters (for compatibility)
+    query_string = scope.get("query_string", b"").decode('utf-8')
+    if query_string and "token=" in query_string:
+        import urllib.parse
+        query_params = urllib.parse.parse_qs(query_string)
+        if "token" in query_params:
+            auth_info["token"] = query_params["token"][0]
+
+    # If no token found, this will be handled by the authentication system
+    # (either return anonymous context if auth disabled, or raise error if auth enabled)
+
+    return auth_info
+
+
 class SecurityLevel(Enum):
     """Security level enumeration"""
 

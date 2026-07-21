@@ -496,7 +496,10 @@ class DorisConfig:
     server_host: str = "localhost"
     server_port: int = 3000
     transport: str = "stdio"
-    
+
+    # Route prefix for reverse proxy (e.g. "/doris" for nginx location /doris/)
+    route_prefix: str = ""
+
     # Temporary files configuration
     temp_files_dir: str = "tmp"  # Temporary files directory for Explain and Profile outputs
 
@@ -929,6 +932,10 @@ class DorisConfig:
         if server_port and server_port.isdigit():
             config.server_port = int(server_port)
         config.temp_files_dir = os.getenv("TEMP_FILES_DIR", config.temp_files_dir)
+        # Normalize route prefix to "/<segment>" (or empty). Must match the handling in
+        # main.update_configuration so from_env() is self-consistent when used directly.
+        _route_prefix = os.getenv("ROUTE_PREFIX", config.route_prefix).strip().strip("/")
+        config.route_prefix = ("/" + _route_prefix) if _route_prefix else ""
 
         return config
 

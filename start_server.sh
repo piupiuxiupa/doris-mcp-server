@@ -77,16 +77,18 @@ export MCP_ALLOW_CREDENTIALS="${MCP_ALLOW_CREDENTIALS:-false}"
 export MCP_DEBUG_ADAPTER="true"
 export PYTHONPATH="$(pwd):$PYTHONPATH"
 
+export ROUTE_PREFIX="${ROUTE_PREFIX:-doris-mcp}"
+
 echo -e "${GREEN}Starting MCP server (Streamable HTTP mode)...${NC}"
-echo -e "${YELLOW}Service will run on http://${MCP_HOST}:${SERVER_PORT}/mcp${NC}"
-echo -e "${YELLOW}Health Check: http://${MCP_HOST}:${SERVER_PORT}/health${NC}"
-echo -e "${YELLOW}MCP Endpoint: http://${MCP_HOST}:${SERVER_PORT}/mcp${NC}"
-echo -e "${YELLOW}Local access: http://localhost:${SERVER_PORT}/mcp${NC}"
+echo -e "${YELLOW}Service will run on http://${MCP_HOST}:${SERVER_PORT}/${ROUTE_PREFIX}/mcp${NC}"
+echo -e "${YELLOW}Health Check: http://${MCP_HOST}:${SERVER_PORT}/${ROUTE_PREFIX}/health${NC}"
+echo -e "${YELLOW}MCP Endpoint: http://${MCP_HOST}:${SERVER_PORT}/${ROUTE_PREFIX}/mcp${NC}"
+echo -e "${YELLOW}Local access: http://localhost:${SERVER_PORT}/${ROUTE_PREFIX}/mcp${NC}"
 echo -e "${YELLOW}Workers: ${WORKERS}${NC}"
 echo -e "${YELLOW}Use Ctrl+C to stop the service${NC}"
 
 # Start the server in HTTP mode (Streamable HTTP)
-python -m doris_mcp_server.main --transport http --host ${MCP_HOST} --port ${SERVER_PORT} --workers ${WORKERS}
+python -m doris_mcp_server.main --transport http --host ${MCP_HOST} --port ${SERVER_PORT} --workers ${WORKERS} --route-prefix "${ROUTE_PREFIX}"
 
 # Check exit status
 if [ $? -ne 0 ]; then
@@ -98,4 +100,4 @@ fi
 echo -e "${YELLOW}Tip: If the page displays abnormally, please clear your browser cache or use incognito mode${NC}"
 echo -e "${YELLOW}Chrome browser clear cache shortcut: Ctrl+Shift+Del (Windows) or Cmd+Shift+Del (Mac)${NC}"
 echo -e "${CYAN}For testing HTTP endpoints, you can use:${NC}"
-echo -e "${CYAN}  curl -X POST http://localhost:${SERVER_PORT}/mcp -H 'Content-Type: application/json' -d '{\"method\":\"tools/list\"}'${NC}" 
+echo -e "${CYAN}  curl -X POST http://localhost:${SERVER_PORT}/${ROUTE_PREFIX}/mcp -H 'Content-Type: application/json' -d '{\"method\":\"tools/list\"}'${NC}" 

@@ -41,13 +41,20 @@ class TimestampedFormatter(logging.Formatter):
     
     def __init__(self, fmt=None, datefmt=None, style='%'):
         if fmt is None:
-            fmt = "%(asctime)s.%(msecs)03d %(level_aligned)s %(name)s:%(lineno)d - %(message)s"
+            fmt = "%(asctime)s.%(msecs)03d %(level_aligned)s [user=%(user)s token=%(token_id)s ip=%(client_ip)s] %(name)s:%(lineno)d - %(message)s"
         if datefmt is None:
             datefmt = "%Y-%m-%d %H:%M:%S"
         super().__init__(fmt, datefmt, style)
     
     def format(self, record):
         """Format log record with enhanced information and proper alignment"""
+        # Ensure request-auth fields always resolve. RequestAuthContextFilter
+        # normally sets them on every record; setdefault is a safety net for
+        # records that somehow bypassed the filter, so format() never KeyErrors.
+        record.__dict__.setdefault("user", "-")
+        record.__dict__.setdefault("token_id", "-")
+        record.__dict__.setdefault("client_ip", "-")
+
         # Add process info if available
         if hasattr(record, 'process') and record.process:
             record.process_info = f"[PID:{record.process}]"
@@ -68,6 +75,32 @@ class TimestampedFormatter(logging.Formatter):
         record.level_aligned = f"[{level_name}]{' ' * padding}"
         
         return super().format(record)
+
+
+class RequestAuthContextFilter(logging.Filter):
+    """Inject the current request's user identity into every log record.
+
+    Reads ``AuthContext`` from the ``mcp_auth_context_var`` ContextVar (set
+    per-request by the HTTP ASGI entrypoints in main.py / multiworker_app.py)
+    and exposes ``user`` / ``token_id`` / ``client_ip`` on the record so the
+    formatter can include them. Falls back to '-' when no request is in flight
+    (stdio mode, startup logs, background threads).
+
+    Attach to a Handler (not a Logger) so it runs for records emitted by any
+    submodule. ``Filter.filter()`` runs before ``Formatter.format()``, so the
+    ``%(user)s`` / ``%(token_id)s`` / ``%(client_ip)s`` placeholders resolve.
+    """
+
+    def filter(self, record):
+        try:
+            from .security import mcp_auth_context_var
+            ctx = mcp_auth_context_var.get()
+        except Exception:
+            ctx = None
+        record.user = getattr(ctx, "user_id", "") or "-"
+        record.token_id = getattr(ctx, "token_id", "") or "-"
+        record.client_ip = getattr(ctx, "client_ip", "") or "-"
+        return True
 
 
 class LevelBasedFileHandler(logging.Handler):
@@ -349,10 +382,11 @@ class DorisLoggerManager:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(getattr(logging, level.upper()))
             console_formatter = TimestampedFormatter(
-                fmt="%(asctime)s.%(msecs)03d %(level_aligned)s %(name)s - %(message)s",
+                fmt="%(asctime)s.%(msecs)03d %(level_aligned)s [user=%(user)s token=%(token_id)s ip=%(client_ip)s] %(name)s - %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S"
             )
             console_handler.setFormatter(console_formatter)
+            console_handler.addFilter(RequestAuthContextFilter())
             handlers.append(console_handler)
         
         # Level-based file handlers
@@ -364,6 +398,7 @@ class DorisLoggerManager:
                 backup_count=backup_count
             )
             level_handler.setLevel(logging.DEBUG)  # Accept all levels
+            level_handler.addFilter(RequestAuthContextFilter())
             handlers.append(level_handler)
         
         # Combined application log (all levels in one file)
@@ -378,6 +413,7 @@ class DorisLoggerManager:
             app_handler.setLevel(getattr(logging, level.upper()))
             app_formatter = TimestampedFormatter()
             app_handler.setFormatter(app_formatter)
+            app_handler.addFilter(RequestAuthContextFilter())
             handlers.append(app_handler)
         
         # Audit logger (separate from main logging)
@@ -397,10 +433,11 @@ class DorisLoggerManager:
                 encoding='utf-8'
             )
             audit_formatter = TimestampedFormatter(
-                fmt="%(asctime)s.%(msecs)03d [AUDIT] %(name)s - %(message)s",
+                fmt="%(asctime)s.%(msecs)03d [AUDIT] [user=%(user)s token=%(token_id)s ip=%(client_ip)s] %(name)s - %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S"
             )
             audit_handler.setFormatter(audit_formatter)
+            audit_handler.addFilter(RequestAuthContextFilter())
             audit_logger.addHandler(audit_handler)
             audit_logger.propagate = False  # Don't propagate to root logger
         

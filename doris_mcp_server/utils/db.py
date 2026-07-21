@@ -389,9 +389,9 @@ class DorisConnectionManager:
         self.minsize = config.database.min_connections  # This is always 0
         self.maxsize = config.database.max_connections or 20
         self.pool_recycle = config.database.max_connection_age or 3600  # 1 hour, more conservative
-        
-        # 🔧 FIX: Add missing monitoring parameters that were removed during refactoring
-        self.health_check_interval = 30  # seconds
+
+        # 🔧 FIX: Honor configured health check interval instead of hardcoding it.
+        self.health_check_interval = config.database.health_check_interval or 30  # seconds
         self.pool_warmup_size = 3  # connections to maintain
     
     def _update_db_params_from_config(self, db_config: dict):
@@ -973,27 +973,103 @@ class DorisConnectionManager:
             self.logger.error(f"Failed to create pool for {db_config['user']}@{db_config['host']}:{db_config['port']}: {type(e).__name__}: {e}")
             raise
     
+    async def _acquire_valid_connection(self, pool: Pool, session_id: str, max_attempts: int = 3) -> Connection:
+        """Acquire a connection from a pool and verify it is alive before returning.
+
+        Stale or half-open connections are common when a pool has been idle longer
+        than the database's wait_timeout or after transient network failures. This
+        helper performs a lightweight validation query on checkout and discards any
+        dead connection instead of handing it to callers.
+
+        Args:
+            pool: The aiomysql pool to acquire from.
+            session_id: Session identifier for logging.
+            max_attempts: Maximum acquisition/validation attempts before giving up.
+
+        Returns:
+            A raw aiomysql Connection that has passed a SELECT 1 validation.
+
+        Raises:
+            RuntimeError: If no valid connection could be acquired.
+        """
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            raw_conn = None
+            try:
+                raw_conn = await asyncio.wait_for(
+                    pool.acquire(),
+                    timeout=self.connect_timeout
+                )
+
+                # Validate the connection with a lightweight, timeout-protected query.
+                try:
+                    async with asyncio.timeout(3):
+                        async with raw_conn.cursor() as cursor:
+                            await cursor.execute("SELECT 1")
+                            result = await cursor.fetchone()
+                            if result and result[0] == 1:
+                                return raw_conn
+                except asyncio.TimeoutError as e:
+                    last_error = e
+                    self.logger.warning(
+                        f"Session {session_id}: Connection validation timed out (attempt {attempt}/{max_attempts})"
+                    )
+                except Exception as e:
+                    last_error = e
+                    self.logger.warning(
+                        f"Session {session_id}: Connection validation failed (attempt {attempt}/{max_attempts}): {e}"
+                    )
+
+                # Validation failed or returned unexpected result; connection is unusable.
+                self.logger.warning(
+                    f"Session {session_id}: Discarding stale connection (attempt {attempt}/{max_attempts})"
+                )
+
+            except asyncio.TimeoutError as e:
+                last_error = e
+                self.logger.warning(
+                    f"Session {session_id}: Connection acquisition timed out (attempt {attempt}/{max_attempts})"
+                )
+            except Exception as e:
+                last_error = e
+                self.logger.warning(
+                    f"Session {session_id}: Connection acquisition failed (attempt {attempt}/{max_attempts}): {e}"
+                )
+
+            # Close the bad connection and notify the pool so its internal counters stay correct.
+            if raw_conn is not None:
+                try:
+                    await raw_conn.ensure_closed()
+                except Exception:
+                    pass
+                try:
+                    pool.release(raw_conn)
+                except Exception:
+                    pass
+
+        raise RuntimeError(
+            f"Failed to acquire a valid connection for session {session_id} "
+            f"after {max_attempts} attempts: {last_error}"
+        )
+
     async def get_connection_for_token(self, token: str, session_id: str) -> 'DorisConnection':
         """Get a connection from the token's dedicated pool
-        
+
         Args:
             token: Authentication token
             session_id: Session identifier for logging
-            
+
         Returns:
             DorisConnection wrapper
         """
         pool, db_config = await self.get_pool_for_token(token)
-        
+
         try:
-            connection = await asyncio.wait_for(
-                pool.acquire(),
-                timeout=self.connect_timeout
-            )
-            
+            connection = await self._acquire_valid_connection(pool, session_id)
+
             self.logger.debug(f"Session {session_id}: Acquired connection from token pool "
                             f"(user: {db_config['user']}@{db_config['host']})")
-            
+
             token_hash = self._get_token_hash(token)
             return DorisConnection(
                 connection,
@@ -1005,14 +1081,13 @@ class DorisConnectionManager:
                 generation=self._token_pool_generations.get(token_hash, 0),
                 owner_pool=pool,
             )
-            
         except Exception as e:
             self.logger.error(f"Session {session_id}: Failed to acquire connection from token pool: {e}")
             raise
     
     async def release_connection_for_token(self, token: str, connection: 'DorisConnection'):
         """Release a connection back to the token's dedicated pool
-        
+
         Args:
             token: Authentication token
             connection: DorisConnection wrapper to release
@@ -1919,20 +1994,19 @@ class DorisConnectionManager:
                     if not self.pool or self.pool.closed:
                         raise RuntimeError("Connection pool is closed and recovery failed")
                 
-                # 🔧 FIX: Increased timeout to prevent hanging
+                # Acquire a validated connection from the pool. This detects and
+                # discards stale connections that may have been closed by the
+                # database due to wait_timeout or network interruptions.
                 try:
-                    raw_conn = await asyncio.wait_for(self.pool.acquire(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    self.logger.error(f"Connection acquisition timed out for session {session_id}")
-                    # Try one recovery attempt
+                    raw_conn = await self._acquire_valid_connection(self.pool, session_id, max_attempts=3)
+                except Exception as acquire_error:
+                    self.logger.error(f"Failed to acquire valid connection for session {session_id}: {acquire_error}")
+                    # Try one recovery attempt if acquisition/validation failed
                     await self._recover_pool_with_lock()
                     if self.pool and not self.pool.closed:
-                        try:
-                            raw_conn = await asyncio.wait_for(self.pool.acquire(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            raise RuntimeError("Connection acquisition timed out after recovery")
+                        raw_conn = await self._acquire_valid_connection(self.pool, session_id, max_attempts=2)
                     else:
-                        raise RuntimeError("Connection acquisition timed out")
+                        raise RuntimeError("Connection acquisition failed and recovery was unsuccessful") from acquire_error
                 
                 # Wrap in DorisConnection
                 doris_conn = DorisConnection(
@@ -2026,12 +2100,27 @@ class DorisConnectionManager:
                 except Exception:
                     pass
                 return
-            
+
             # Check connection state before release
             if connection.connection.closed:
                 self.logger.debug(f"Connection already closed for session {session_id}")
                 return
-            
+
+            # Do not return known-unhealthy connections to the pool; close them so
+            # the pool creates fresh ones on demand.
+            if not connection.is_healthy:
+                self.logger.debug(f"Connection marked unhealthy for session {session_id}, closing instead of releasing")
+                try:
+                    await connection.connection.ensure_closed()
+                except Exception:
+                    pass
+                # Still notify the pool so its internal counters stay correct.
+                try:
+                    self.pool.release(connection.connection)
+                except Exception:
+                    pass
+                return
+
             # 🔧 FIX: Simplified release operation without thread wrapper
             try:
                 self.pool.release(connection.connection)

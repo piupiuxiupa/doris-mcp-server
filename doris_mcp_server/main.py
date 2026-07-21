@@ -259,38 +259,13 @@ class DorisServer:
         self._setup_handlers()
 
     async def _extract_auth_info_from_scope(self, scope, headers):
-        """Extract authentication information from ASGI scope and headers"""
-        auth_info = {}
-        
-        # Extract client IP
-        client = scope.get("client")
-        if client:
-            auth_info["client_ip"] = client[0]
-        else:
-            auth_info["client_ip"] = "unknown"
-        
-        # Extract token from Authorization header
-        authorization = headers.get(b'authorization', b'').decode('utf-8')
-        if authorization:
-            if authorization.startswith('Bearer '):
-                auth_info["token"] = authorization[7:]
-                auth_info["authorization"] = authorization
-            elif authorization.startswith('Token '):
-                auth_info["token"] = authorization[6:]
-                auth_info["authorization"] = authorization
-        
-        # Extract token from query parameters (for compatibility)
-        query_string = scope.get("query_string", b"").decode('utf-8')
-        if query_string and "token=" in query_string:
-            import urllib.parse
-            query_params = urllib.parse.parse_qs(query_string)
-            if "token" in query_params:
-                auth_info["token"] = query_params["token"][0]
-        
-        # If no token found, this will be handled by the authentication system
-        # (either return anonymous context if auth disabled, or raise error if auth enabled)
-        
-        return auth_info
+        """Extract authentication information from ASGI scope and headers.
+
+        Thin wrapper around the shared :func:`extract_auth_info_from_scope`
+        so the single-worker and multi-worker entrypoints use identical logic.
+        """
+        from .utils.security import extract_auth_info_from_scope
+        return extract_auth_info_from_scope(scope, headers)
 
     def _get_mcp_capabilities(self):
         """Get MCP capabilities with version compatibility"""
@@ -565,6 +540,19 @@ class DorisServer:
             
             self.logger.info(f"StreamableHTTP session manager created, will start at http://{host}:{port}")
             
+            # Root info endpoint
+            async def root_info(request):
+                return JSONResponse({
+                    "service": "doris-mcp-server",
+                    "mode": "single-worker",
+                    "mcp_initialized": True,
+                    "route_prefix": route_prefix or None,
+                    "endpoints": {
+                        "health": f"{route_prefix}/health" if route_prefix else "/health",
+                        "mcp": f"{route_prefix}/mcp" if route_prefix else "/mcp",
+                    }
+                })
+            
             # Health check endpoint
             async def health_check(request):
                 return JSONResponse({"status": "healthy", "service": "doris-mcp-server"})
@@ -625,7 +613,7 @@ class DorisServer:
                     self.logger.info("Application is shutting down...")
             
             effective_auth = get_effective_auth_config(self.config)
-            routes = [Route("/health", health_check, methods=["GET"])]
+            routes = [Route("/", root_info, methods=["GET"]), Route("/health", health_check, methods=["GET"])]
             if effective_auth.enable_external_oauth_auth:
                 routes.extend([
                     Route("/auth/login", oauth_login, methods=["GET"]),
@@ -694,6 +682,8 @@ class DorisServer:
             )
             
             # Custom ASGI app that handles both /mcp and /mcp/ without redirects
+            route_prefix = self.config.route_prefix
+
             async def mcp_app(scope, receive, send):
                 # Handle lifespan events
                 if scope["type"] == "lifespan":
@@ -703,6 +693,14 @@ class DorisServer:
                 # Handle HTTP requests
                 if scope["type"] == "http":
                     path = scope.get("path", "")
+                    
+                    # Strip route prefix if configured
+                    if route_prefix and path.startswith(route_prefix):
+                        path = path[len(route_prefix):] or "/"
+                        scope = dict(scope)
+                        scope["path"] = path
+                        scope["root_path"] = route_prefix
+
                     self.logger.info(f"Received request for path: {path}")
                     
                     try:
@@ -712,7 +710,8 @@ class DorisServer:
                             await response(scope, receive, send)
                             return
 
-                        if (path.startswith("/health") or 
+                        if (path == "/" or
+                            path.startswith("/health") or
                             path.startswith("/auth/") or 
                             path.startswith("/token/") or
                             path.startswith("/.well-known/") or
@@ -756,13 +755,20 @@ class DorisServer:
                 self.logger.info(f"Using multi-process mode with {workers} workers")
                 self.logger.info("Note: Multi-worker mode provides full MCP functionality with independent worker processes")
                 
+                # Propagate the normalized route prefix to worker processes via env var.
+                # Workers re-import the app module and cannot share this config object, and
+                # we deliberately do NOT pass uvicorn's root_path (it *prepends* the prefix
+                # to scope["path"] rather than stripping it — see app-level stripping below).
+                if route_prefix:
+                    os.environ["ROUTE_PREFIX"] = route_prefix
+
                 # Use the dedicated multiworker app module with full MCP support
                 uvicorn.run(
                     "doris_mcp_server.multiworker_app:app",
                     host=host,
                     port=port,
                     workers=workers,
-                    log_level="info"
+                    log_level="info",
                 )
                 
             else:
@@ -772,7 +778,7 @@ class DorisServer:
                     app=mcp_app,
                     host=host,
                     port=port,
-                    log_level="info"
+                    log_level="info",
                 )
                 server = uvicorn.Server(config)
                 
@@ -892,6 +898,13 @@ Examples:
         help=f"Log level (default: {_default_config.logging.level})",
     )
 
+    parser.add_argument(
+        "--route-prefix",
+        type=str,
+        default=os.getenv("ROUTE_PREFIX", _default_config.route_prefix),
+        help=f"Route prefix for reverse proxy, e.g. /doris (default: {_default_config.route_prefix or 'none'})",
+    )
+
     return parser
 
 
@@ -943,6 +956,11 @@ def update_configuration(config: DorisConfig):
         config.workers = args.workers
         _mark_source(config, "workers", "cli")
 
+    # Route prefix for reverse proxy
+    route_prefix = getattr(args, 'route_prefix', '').strip().strip('/')
+    if route_prefix:
+        config.route_prefix = '/' + route_prefix
+
 
 async def main():
     """Main function"""
@@ -968,6 +986,8 @@ async def main():
     logger.info("Starting Doris MCP Server...")
     logger.info(f"Transport: {config.transport}")
     logger.info(f"Log Level: {config.logging.level}")
+    if config.route_prefix:
+        logger.info(f"Route Prefix: {config.route_prefix}")
 
     try:
         effective_auth = normalize_effective_auth_config(

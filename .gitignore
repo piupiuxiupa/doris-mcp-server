@@ -21,3 +21,6 @@ venv.bak/
 .idea/
 .coverage
 coverage.xml
+.claude/
+.sisyphus/
+.pytest_cache/

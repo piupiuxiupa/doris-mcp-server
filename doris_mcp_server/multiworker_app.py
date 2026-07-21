@@ -743,6 +743,16 @@ async def app(scope, receive, send):
     """Main ASGI app that routes requests"""
     path = scope.get('path', '/')
     
+    # Strip route prefix if configured
+    route_prefix = os.getenv("ROUTE_PREFIX", "").strip().strip("/")
+    if route_prefix:
+        route_prefix = "/" + route_prefix
+    if route_prefix and path.startswith(route_prefix):
+        path = path[len(route_prefix):] or "/"
+        scope = dict(scope)
+        scope["path"] = path
+        scope["root_path"] = route_prefix
+
     if path == "/mcp" or path.startswith('/mcp/'):
         if scope.get("type") == "http" and scope.get("method", "UNKNOWN") == "OPTIONS":
             response = mcp_cors_preflight_response(scope)
