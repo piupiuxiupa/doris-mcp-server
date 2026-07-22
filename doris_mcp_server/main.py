@@ -762,6 +762,14 @@ class DorisServer:
                 if route_prefix:
                     os.environ["ROUTE_PREFIX"] = route_prefix
 
+                # Propagate the resolved transport too. Worker processes rebuild their
+                # config via DorisConfig.from_env() and never see this process's CLI args,
+                # so without this they default to transport="stdio" — which makes
+                # ConfigManager.setup_logging() treat them as stdio and DISABLE console
+                # logging (enable_console = not is_stdio_mode), silently dropping every
+                # worker's application log from the terminal even though file logs work.
+                os.environ["TRANSPORT"] = self.config.transport
+
                 # Use the dedicated multiworker app module with full MCP support
                 uvicorn.run(
                     "doris_mcp_server.multiworker_app:app",
