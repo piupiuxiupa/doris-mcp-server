@@ -410,6 +410,7 @@ Please generate accurate and efficient SQL queries based on the above requiremen
 
     async def _get_database_context(self) -> str:
         """Get database context information"""
+        connection = None
         try:
             connection = await self.connection_manager.get_connection("system")
 
@@ -458,6 +459,10 @@ Main data tables:"""
 
         except Exception as e:
             return f"Unable to get database context information: {str(e)}"
+        finally:
+            # 🔧 FIX: release the connection on every exit path to prevent pool exhaustion.
+            if connection is not None:
+                await self.connection_manager.release_connection("system", connection)
 
     def get_templates_by_category(self, category: str) -> list[PromptTemplate]:
         """Get templates by category"""

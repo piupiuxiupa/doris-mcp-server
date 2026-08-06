@@ -49,6 +49,38 @@ from ..utils.security import get_current_auth_context
 logger = get_logger(__name__)
 
 
+def _json_default(obj):
+    """Fallback JSON serializer for types json.dumps() cannot handle natively.
+
+    Defense-in-depth: ADBC/Arrow returns DECIMAL as decimal.Decimal and some
+    metadata queries return datetime/date/bytes. Without this, json.dumps()
+    raises "Object of type Decimal is not JSON serializable" and the whole tool
+    call fails even though the query itself succeeded.
+    """
+    import decimal
+    from datetime import date as _date
+    if isinstance(obj, decimal.Decimal):
+        try:
+            return float(obj)
+        except (ValueError, OverflowError):
+            return str(obj)
+    if isinstance(obj, (datetime, _date)):
+        return obj.isoformat()
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.decode("utf-8")
+        except UnicodeDecodeError:
+            return obj.hex()
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
+
+
+def _json_dumps(obj, **kwargs):
+    """json.dumps with a safe default serializer applied everywhere."""
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=_json_default, **kwargs)
+
+
 
 class DorisToolsManager:
     """Apache Doris Tools Manager"""
@@ -1454,7 +1486,7 @@ No parameters required. Returns connection status, configuration, and diagnostic
                     "timestamp": datetime.now().isoformat(),
                 }
             
-            return json.dumps(result, ensure_ascii=False, indent=2)
+            return _json_dumps(result)
             
         except OperationAuthorizationError:
             raise
@@ -1466,7 +1498,7 @@ No parameters required. Returns connection status, configuration, and diagnostic
                 "arguments": arguments,
                 "timestamp": datetime.now().isoformat(),
             }
-            return json.dumps(error_result, ensure_ascii=False, indent=2)
+            return _json_dumps(error_result)
     
     
     async def _exec_query_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:

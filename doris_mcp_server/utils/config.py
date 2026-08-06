@@ -211,10 +211,17 @@ class DatabaseConfig:
     # Note: min_connections is fixed at 0 to avoid at_eof connection issues
     # This prevents pre-creation of connections which can cause state problems
     _min_connections: int = field(default=0, init=False)  # Internal use only, always 0
-    max_connections: int = 20
+    # 🔧 IMPORTANT: total physical DB connections ≈ workers × max_connections × token_pools.
+    # This must stay comfortably below the Doris user connection limit
+    # (max_user_connection_num, often 100). With --workers 4 and several static
+    # tokens, keep max_connections small (default 8). Tune DORIS_MAX_CONNECTIONS
+    # in .env so that workers × max_connections × token_count < Doris limit.
+    max_connections: int = 8
     connection_timeout: int = 30
     health_check_interval: int = 60
-    max_connection_age: int = 3600
+    # Shorter recycle time turns connections over faster so leaked/stale
+    # sockets are replaced sooner (default 1800s = 30min).
+    max_connection_age: int = 1800
 
     @property
     def min_connections(self) -> int:
@@ -622,6 +629,21 @@ class DorisConfig:
         config.database.max_connection_age = int(
             os.getenv("DORIS_MAX_CONNECTION_AGE", str(config.database.max_connection_age))
         )
+
+        # 🔧 SAFETY GUARD: total physical DB connections ≈ workers × max_connections (× token_pools).
+        # Warn loudly when this approaches the typical Doris user connection limit (100),
+        # which is the #1 cause of "Reach limit of connections" / pool exhaustion outages.
+        _workers = int(os.getenv("WORKERS", "1") or "1")
+        _max_conn = config.database.max_connections
+        _conn_ceiling = _workers * _max_conn
+        if _conn_ceiling >= 80:
+            logging.warning(
+                "⚠️  Estimated peak DB connections (WORKERS=%d × DORIS_MAX_CONNECTIONS=%d = %d, "
+                "before per-token pools) approaches the typical Doris user connection limit (100). "
+                "This can cause 'Reach limit of connections' errors. Reduce DORIS_MAX_CONNECTIONS "
+                "and/or WORKERS, or raise the Doris user limit (max_user_connection_num).",
+                _workers, _max_conn, _conn_ceiling,
+            )
 
         # Security configuration
         # Independent authentication switches

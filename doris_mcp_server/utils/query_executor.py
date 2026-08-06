@@ -696,9 +696,16 @@ class DorisQueryExecutor:
         """Get query execution plan"""
         explain_sql = f"EXPLAIN {sql}"
 
-        connection = await self.connection_manager.get_connection(session_id)
-        auth_context = get_auth_context()
-        result = await connection.execute(explain_sql, auth_context=auth_context)
+        connection = None
+        try:
+            connection = await self.connection_manager.get_connection(session_id)
+            auth_context = get_auth_context()
+            result = await connection.execute(explain_sql, auth_context=auth_context)
+        finally:
+            # 🔧 CRITICAL FIX: always release the acquired connection, otherwise a
+            # query error (timeout, syntax error, ...) leaks the pool slot.
+            if connection is not None:
+                await self._release_routed_connection(session_id, connection)
 
         return {
             "query": sql,
@@ -912,8 +919,13 @@ class DorisQueryExecutor:
                     self.logger.warning(f"Connection error detected, retrying ({retry_count}/{max_retries}): {e}")
                     
                     # Release the problematic connection
+                    # NOTE: the connection acquired for this query is already
+                    # released by DorisConnectionManager.execute_query() in its
+                    # own finally block, so there is nothing extra to release
+                    # here. The previous call passed the wrong number of
+                    # arguments and silently failed, masking real errors.
                     try:
-                        await self.connection_manager.release_connection(session_id)
+                        await self.connection_manager.session_cache.remove(session_id)
                     except Exception:
                         pass  # Ignore cleanup errors
                     

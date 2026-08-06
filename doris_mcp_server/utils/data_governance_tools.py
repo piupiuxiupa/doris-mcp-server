@@ -64,6 +64,7 @@ class DataGovernanceTools:
             catalog_name: Catalog name
             db_name: Database name
         """
+        connection = None
         try:
             start_time = time.time()
             
@@ -143,6 +144,10 @@ class DataGovernanceTools:
                 "target_column": f"{table_name}.{column_name}",
                 "analysis_timestamp": datetime.now().isoformat()
             }
+        finally:
+            # 🔧 FIX: release the connection on every exit path to prevent pool exhaustion.
+            if connection is not None:
+                await self.connection_manager.release_connection("query", connection)
     
     async def monitor_data_freshness(
         self, 
@@ -160,6 +165,7 @@ class DataGovernanceTools:
             catalog_name: Catalog name
             db_name: Database name
         """
+        connection = None
         try:
             start_time = time.time()
             connection = await self.connection_manager.get_connection("query")
@@ -219,6 +225,10 @@ class DataGovernanceTools:
                 "error": str(e),
                 "monitoring_timestamp": datetime.now().isoformat()
             }
+        finally:
+            # 🔧 FIX: release the connection on every exit path to prevent pool exhaustion.
+            if connection is not None:
+                await self.connection_manager.release_connection("query", connection)
     
     # ==================== Private Helper Methods ====================
     

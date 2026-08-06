@@ -684,6 +684,7 @@ class DorisMonitoringTools:
     
     async def get_be_nodes(self) -> List[Dict[str, Any]]:
         """Get BE node information, prioritize configured be_hosts, fallback to SHOW BACKENDS"""
+        connection = None
         try:
             # Get database configuration
             db_config = self.connection_manager.config.database
@@ -741,6 +742,10 @@ class DorisMonitoringTools:
         except Exception as e:
             logger.error(f"Failed to get BE nodes: {str(e)}")
             return []
+        finally:
+            # 🔧 FIX: release the connection on every exit path to prevent pool exhaustion.
+            if connection is not None:
+                await self.connection_manager.release_connection("query", connection)
     
     async def fetch_metrics_from_url(self, url: str, node_type: str, node_info: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch monitoring metrics from specified URL"""

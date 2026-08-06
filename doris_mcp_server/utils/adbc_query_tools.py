@@ -23,7 +23,7 @@ High-performance data querying using Apache Arrow Flight SQL protocol
 import os
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from ..utils.logger import get_logger
@@ -34,12 +34,20 @@ logger = get_logger(__name__)
 
 
 def _convert_numpy_types(obj):
-    """Convert numpy types to native Python types for JSON serialization"""
+    """Convert numpy/pandas/decimal types to native Python types for JSON serialization"""
     try:
         # Import numpy only when needed
         import numpy as np
         import pandas as pd
-        
+
+        # 🔧 FIX: ADBC/Arrow exposes DECIMAL columns as Python decimal.Decimal.
+        # json.dumps() cannot serialize Decimal, so coerce to float (or str if too big).
+        import decimal
+        if isinstance(obj, decimal.Decimal):
+            try:
+                return float(obj)
+            except (ValueError, OverflowError):
+                return str(obj)
         if isinstance(obj, np.integer):
             return int(obj)
         elif isinstance(obj, np.floating):
@@ -50,12 +58,36 @@ def _convert_numpy_types(obj):
             return obj.tolist()
         elif isinstance(obj, (pd.Timestamp, pd.NaT.__class__)):
             return str(obj)
-        elif pd.isna(obj):
-            return None
+        elif isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        elif isinstance(obj, bytes):
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                return obj.hex()
         else:
+            # pd.isna() raises on some container types; only call it for scalars.
+            try:
+                if pd.isna(obj):
+                    return None
+            except (TypeError, ValueError):
+                pass
             return obj
     except ImportError:
-        # If numpy/pandas not available, return as-is
+        # If numpy/pandas not available, still handle Decimal/datetime.
+        import decimal
+        if isinstance(obj, decimal.Decimal):
+            try:
+                return float(obj)
+            except (ValueError, OverflowError):
+                return str(obj)
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, bytes):
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                return obj.hex()
         return obj
 
 
@@ -267,6 +299,7 @@ class DorisADBCQueryTools:
     
     async def _get_be_hosts(self) -> List[str]:
         """Get BE host list"""
+        connection = None
         try:
             db_config = self.connection_manager.config.database
             
@@ -294,6 +327,10 @@ class DorisADBCQueryTools:
         except Exception as e:
             logger.error(f"Failed to get BE hosts: {str(e)}")
             return []
+        finally:
+            # 🔧 FIX: release the connection on every exit path to prevent pool exhaustion.
+            if connection is not None:
+                await self.connection_manager.release_connection("query", connection)
     
     async def _import_adbc_modules(self) -> Dict[str, Any]:
         """Import ADBC related modules"""

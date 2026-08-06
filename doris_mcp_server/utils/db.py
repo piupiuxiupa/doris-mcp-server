@@ -377,9 +377,6 @@ class DorisConnectionManager:
         self._connection_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         
-        # 🔧 FIX: Add connection acquisition queue to serialize requests
-        self._connection_semaphore = asyncio.Semaphore(value=20)  # Max concurrent acquisitions
-        
         # Database connection parameters from config.database
         self.pool_recovery_lock = self._recovery_lock  # Compatibility alias
         self._update_db_params_from_config(self.active_db_config)
@@ -389,6 +386,12 @@ class DorisConnectionManager:
         self.minsize = config.database.min_connections  # This is always 0
         self.maxsize = config.database.max_connections or 20
         self.pool_recycle = config.database.max_connection_age or 3600  # 1 hour, more conservative
+
+        # 🔧 FIX: Add connection acquisition queue to serialize requests.
+        # Cap concurrent acquisitions at the pool size so a saturated pool does
+        # not accumulate a long queue of waiters (each still holding a semaphore
+        # slot) which amplifies connection pressure under load.
+        self._connection_semaphore = asyncio.Semaphore(value=max(1, self.maxsize))
 
         # 🔧 FIX: Honor configured health check interval instead of hardcoding it.
         self.health_check_interval = config.database.health_check_interval or 30  # seconds
@@ -579,6 +582,33 @@ class DorisConnectionManager:
                     await result
         except Exception as e:
             self.logger.debug(f"Error force closing connection after {reason}: {e}")
+
+    async def _discard_pool_connection(self, pool: Pool | None, raw_connection: Any, reason: str) -> None:
+        """Close a checked-out pool connection AND release its slot.
+
+        aiomysql's Pool tracks every acquired connection in an internal "in
+        use" set and only removes it from that set inside release(). Calling
+        ensure_closed()/close() on a checked-out connection WITHOUT release()
+        leaves the slot permanently counted as in-use, which exhausts the pool
+        after ``maxsize`` such leaks (root cause of the connection-exhaustion
+        outage). This helper closes the underlying socket first (so the bad
+        connection is never handed back out) and then releases the slot so the
+        pool can reclaim it.
+        """
+        if not raw_connection:
+            return
+        await self._force_close_raw_connection(raw_connection, reason)
+        if pool is not None:
+            release = getattr(pool, "release", None)
+            if release:
+                try:
+                    release(raw_connection)
+                except Exception as release_error:
+                    self.logger.debug(
+                        "pool.release() failed during discard (%s): %s",
+                        reason,
+                        release_error,
+                    )
 
     async def _close_auth_connection(self, conn: Any) -> None:
         if not conn:
@@ -1037,15 +1067,9 @@ class DorisConnectionManager:
                 )
 
             # Close the bad connection and notify the pool so its internal counters stay correct.
+            # 🔧 CRITICAL: must release() after close, otherwise the slot leaks.
             if raw_conn is not None:
-                try:
-                    await raw_conn.ensure_closed()
-                except Exception:
-                    pass
-                try:
-                    pool.release(raw_conn)
-                except Exception:
-                    pass
+                await self._discard_pool_connection(pool, raw_conn, "failed checkout validation")
 
         raise RuntimeError(
             f"Failed to acquire a valid connection for session {session_id} "
@@ -1700,12 +1724,12 @@ class DorisConnectionManager:
 
         except Exception as e:
             self.logger.error(f"Pool warmup failed: {e}")
-            # Clean up any remaining connections
+            # Clean up any remaining connections. 🔧 FIX: release them back to
+            # the pool (close-then-release) instead of only ensure_closed(),
+            # otherwise every warmup connection held during a failure leaks a
+            # pool slot.
             for conn in warmup_connections:
-                try:
-                    await conn.ensure_closed()
-                except Exception:
-                    pass
+                await self._discard_pool_connection(self.pool, conn, "pool warmup failure")
 
     async def _pool_health_monitor(self):
         """Background task to monitor pool health"""
@@ -1758,46 +1782,53 @@ class DorisConnectionManager:
             await self._recover_pool()
 
     async def _cleanup_stale_connections(self):
-        """Proactively clean up potentially stale connections"""
+        """Proactively clean up potentially stale connections.
+
+        🔧 CRITICAL: Every connection acquired from the pool MUST be released
+        back to it. ensure_closed() alone keeps the connection in the pool's
+        internal "in use" set forever, which slowly exhausts the pool.
+        """
+        if not self.pool or getattr(self.pool, "closed", False):
+            return
         try:
             self.logger.debug("🧹 Checking for stale connections")
-            
+
             # Get pool statistics
             pool_size = self.pool.size
             pool_free = self.pool.freesize
-            
+
             # If pool has idle connections, test some of them
             if pool_free > 0:
                 test_count = min(pool_free, 2)  # Test up to 2 idle connections
-                
+
                 for i in range(test_count):
+                    conn = None
                     try:
                         # Acquire connection, test it, and release
                         conn = await asyncio.wait_for(self.pool.acquire(), timeout=5)
-                        
+
                         # Quick test
                         async with conn.cursor() as cursor:
                             await asyncio.wait_for(cursor.execute("SELECT 1"), timeout=3)
                             await cursor.fetchone()
-                        
+
                         # Connection is healthy, release it
                         self.pool.release(conn)
-                        
+                        conn = None
                     except asyncio.TimeoutError:
                         self.logger.debug(f"Stale connection test {i+1} timed out")
-                        try:
-                            await conn.ensure_closed()
-                        except Exception:
-                            pass
                     except Exception as e:
                         self.logger.debug(f"Stale connection test {i+1} failed: {e}")
-                        try:
-                            await conn.ensure_closed()
-                        except Exception:
-                            pass
-                
+                    finally:
+                        # 🔧 CRITICAL FIX: Always close-then-release bad connections.
+                        # Closing without releasing leaks the pool slot forever.
+                        if conn is not None:
+                            await self._discard_pool_connection(
+                                self.pool, conn, "stale connection cleanup"
+                            )
+
                 self.logger.debug(f"Stale connection cleanup completed, tested {test_count} connections")
-                
+
         except Exception as e:
             self.logger.error(f"Stale connection cleanup error: {e}")
 

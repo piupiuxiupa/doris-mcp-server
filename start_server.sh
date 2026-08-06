@@ -68,7 +68,7 @@ fi
 export MCP_TRANSPORT_TYPE="http"
 export MCP_HOST="${MCP_HOST:-0.0.0.0}"
 export SERVER_PORT="${SERVER_PORT:-3000}"  # Changed from MCP_PORT to SERVER_PORT
-export WORKERS="${WORKERS:-1}"
+export WORKERS="${WORKERS:-2}"
 export ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-*}"
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export MCP_ALLOW_CREDENTIALS="${MCP_ALLOW_CREDENTIALS:-false}"
